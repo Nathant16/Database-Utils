@@ -1,8 +1,12 @@
 import json
 import os
+import sys
 import pymysql
 import shutil
 from tabulate import tabulate
+
+# Отключаем создание папки __pycache__ и .pyc файлов
+sys.dont_write_bytecode = True
 
 if os.name == 'nt':
     import msvcrt
@@ -10,7 +14,7 @@ if os.name == 'nt':
 else:
     msvcrt = None
 
-CONFIG_FILE = "db_templates.json"
+CONFIG_FILE = "data.json"
 
 RU_CHARS = "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,ёЁ"
 EN_CHARS = "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?`~"
@@ -163,13 +167,25 @@ def load_templates():
         return []
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         try:
-            return json.load(f)
+            data = json.load(f)
+            # Поддержка нового формата со словарем
+            if isinstance(data, dict):
+                return data.get("templates", [])
+            # Поддержка старого формата (если там был просто список)
+            elif isinstance(data, list):
+                return data
+            return []
         except json.JSONDecodeError:
             return []
 
 def save_templates(templates):
+    # Сохраняем "кэш" первым ключом, как вы и просили
+    data = {
+        "cache": None,
+        "templates": templates
+    }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(templates, f, indent=4, ensure_ascii=False)
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def connect_to_db(ip, port, user, password, database):
     try:
