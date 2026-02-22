@@ -25,13 +25,12 @@ def add_log(message):
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
-def resize_window():
+def resize_window(cols=99, req_lines=35):
     if os.name == 'nt':
         # 1. Попытка через старый mode (для обычного cmd.exe)
-        # Устанавливаем ширину ровно в 99 символов под размер логотипа
-        os.system('mode con: cols=99 lines=35')
+        os.system(f'mode con: cols={cols} lines={req_lines}')
         # 2. Попытка через ANSI-последовательность
-        print("\x1b[8;35;99t", end='', flush=True)
+        print(f"\x1b[8;{req_lines};{cols}t", end='', flush=True)
 
 def print_logs():
     if not USER_LOGS:
@@ -40,14 +39,12 @@ def print_logs():
     print("\033[s", end="", flush=True)
     
     term_size = shutil.get_terminal_size()
-    # Number of log lines to show (max 2)
     num_logs = len(USER_LOGS)
     
     for i, log in enumerate(USER_LOGS):
         # Calculate row (lines is total height, rows are 1-indexed)
-        # We want the last num_logs lines
         row = term_size.lines - (num_logs - 1 - i)
-        # \033[row;colH moves cursor, \033[K clears the line
+        # \033[row;1H moves cursor, \033[K clears the line
         print(f"\033[{row};1H\033[K{log}", end="", flush=True)
         
     # Restore cursor position
@@ -116,6 +113,187 @@ def connect_to_db(ip, port, user, password, database):
     except Exception as e:
         print(f"Connection error: {e}")
 
+def manage_table(connection, db_name, table_name):
+    while True:
+        table_output = "(Table is empty)"
+        req_lines = len(USER_LOGS) + 15
+        req_cols = 99
+        
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 50")
+                rows = cursor.fetchall()
+                if rows:
+                    columns = [desc[0] for desc in cursor.description]
+                    table_output = tabulate(rows, headers=columns, tablefmt="grid")
+                    table_lines = table_output.split('\n')
+                    req_cols = max((len(line) for line in table_lines), default=0) + 4
+                    req_lines = len(table_lines) + len(USER_LOGS) + 13
+        except Exception as e:
+            table_output = f"(Error reading table: {e})"
+            req_lines = len(table_output.split('\n')) + len(USER_LOGS) + 13
+            
+        resize_window(max(99, req_cols), req_lines)
+        clear_screen()
+        
+        print(f"=== Table '{table_name}' in DB '{db_name}' ===")
+        print(table_output)
+            
+        print("\nActions:")
+        print("1. Add column")
+        print("2. Delete column")
+        print("3. Add row")
+        print("4. Delete row")
+        
+        print("-" * 20)
+        print("b. Return to tables list\n")
+        
+        # Reserve lines for logs below the prompt so ANSI restoration doesn't cause overlap
+        if USER_LOGS:
+            print("\n" * (len(USER_LOGS) + 2), end="")
+            print(f"\033[{len(USER_LOGS) + 2}A", end="") # Move cursor back up (gap + logs)
+            
+        print_logs()
+        
+        choice = get_input("Select action: ").lower()
+        
+        if choice == 'b':
+            add_log(f"Returned to tables list")
+            resize_window(99, 35)
+            break
+            
+        elif choice == '1':
+            clear_screen()
+            print(f"--- Add column to '{table_name}' ---")
+            col_name = get_input("Enter new column name: ")
+            if not col_name:
+                add_log("Add column cancelled")
+                continue
+            col_type = get_input("Enter column type (e.g. VARCHAR(255), INT): ")
+            if not col_type:
+                add_log("Add column cancelled")
+                continue
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN `{col_name}` {col_type}")
+                    connection.commit()
+                    add_log(f"Column '{col_name}' added to '{table_name}'")
+            except Exception as e:
+                add_log(f"Error adding column: {e}")
+                
+        elif choice == '2':
+            clear_screen()
+            print(f"--- Delete column from '{table_name}' ---")
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"DESCRIBE `{table_name}`")
+                    columns_desc = cursor.fetchall()
+            except Exception as e:
+                add_log(f"Error reading columns: {e}")
+                continue
+                
+            for i, col in enumerate(columns_desc):
+                print(f"{i+1}. {col[0]} ({col[1]})")
+                
+            print("-" * 20)
+            col_input = get_input("Enter column number or name to delete (b to cancel): ")
+            if col_input.lower() == 'b' or not col_input:
+                add_log("Delete column cancelled")
+                continue
+                
+            col_name = col_input
+            if col_input.isdigit() and 1 <= int(col_input) <= len(columns_desc):
+                col_name = columns_desc[int(col_input) - 1][0]
+                
+            confirm = get_input(f"Are you sure you want to delete column '{col_name}'? (y/n): ").lower()
+            if confirm == 'y':
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(f"ALTER TABLE `{table_name}` DROP COLUMN `{col_name}`")
+                        connection.commit()
+                        add_log(f"Column '{col_name}' deleted from '{table_name}'")
+                except Exception as e:
+                    add_log(f"Error deleting column: {e}")
+                    
+        elif choice == '3':
+            clear_screen()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"DESCRIBE `{table_name}`")
+                    columns_desc = cursor.fetchall()
+                    
+                cols_to_insert = []
+                vals_to_insert = []
+                print(f"--- Add row to '{table_name}' ---")
+                print("Leave empty to skip a column (useful for AUTO_INCREMENT).\n")
+                
+                for col in columns_desc:
+                    col_name = col[0]
+                    col_type_str = col[1]
+                    val = get_input(f"Value for `{col_name}` ({col_type_str}): ")
+                    if val:
+                        cols_to_insert.append(f"`{col_name}`")
+                        vals_to_insert.append(val)
+                        
+                if cols_to_insert:
+                    placeholders = ", ".join(["%s"] * len(vals_to_insert))
+                    cols_str = ", ".join(cols_to_insert)
+                    query = f"INSERT INTO `{table_name}` ({cols_str}) VALUES ({placeholders})"
+                    
+                    with connection.cursor() as cursor:
+                        cursor.execute(query, tuple(vals_to_insert))
+                        connection.commit()
+                        add_log(f"Row added to '{table_name}'")
+                else:
+                    add_log("Insert skipped: no values provided")
+                    
+            except Exception as e:
+                add_log(f"Error adding row: {e}")
+                
+        elif choice == '4':
+            clear_screen()
+            print(f"--- Delete row from '{table_name}' ---")
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"DESCRIBE `{table_name}`")
+                    columns_desc = cursor.fetchall()
+            except Exception as e:
+                add_log(f"Error reading columns: {e}")
+                continue
+                
+            print("Select column to match for deletion:")
+            for i, col in enumerate(columns_desc):
+                print(f"{i+1}. {col[0]} ({col[1]})")
+                
+            print("-" * 20)
+            col_input = get_input("Enter column number or name (b to cancel): ")
+            if col_input.lower() == 'b' or not col_input:
+                add_log("Delete row cancelled")
+                continue
+                
+            col_name = col_input
+            if col_input.isdigit() and 1 <= int(col_input) <= len(columns_desc):
+                col_name = columns_desc[int(col_input) - 1][0]
+                
+            val = get_input(f"Enter value for `{col_name}` to delete: ")
+            if not val:
+                add_log("Delete row cancelled")
+                continue
+                
+            confirm = get_input(f"Are you sure you want to delete row where `{col_name}`='{val}'? (y/n): ").lower()
+            if confirm == 'y':
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(f"DELETE FROM `{table_name}` WHERE `{col_name}` = %s", (val,))
+                        affected = cursor.rowcount
+                        connection.commit()
+                        add_log(f"Deleted {affected} row(s) from '{table_name}'")
+                except Exception as e:
+                    add_log(f"Error deleting row: {e}")
+                    
+        else:
+            add_log(f"Invalid choice: {choice}")
+
 def explore_tables(connection, db_name):
     while True:
         try:
@@ -126,23 +304,32 @@ def explore_tables(connection, db_name):
             add_log(f"Error retrieving tables list: {e}")
             return
 
-        clear_screen()
-        print(f"\n=== Tables in DB: {db_name} ===")
-        for i, table in enumerate(tables):
-            print(f"{i}. {table}")
-        print("-" * 20)
-        print("11. Create new table")
-        print("12. Delete table")
+        req_lines = len(tables) + len(USER_LOGS) + 14
+        resize_window(99, req_lines)
         
-        print("\nb. Return to main menu")
+        clear_screen()
+        print(f"=== Tables in DB: {db_name} ===")
+        for i, table in enumerate(tables):
+            print(f"{i+1}. {table}")
+        print("-" * 20)
+        print("c. Create new table")
+        print("d. Delete table")
+        
+        print("\nb. Return to main menu\n")
+        
+        # Reserve lines for logs below the prompt so ANSI restoration doesn't cause overlap
+        if USER_LOGS:
+            print("\n" * (len(USER_LOGS) + 2), end="")
+            print(f"\033[{len(USER_LOGS) + 2}A", end="") # Move cursor back up (gap + logs)
+            
         print_logs()
         
-        choice = get_input("\n\nChoose action or table index: ").lower()
+        choice = get_input("Choose action or table index: ").lower()
         if choice == 'b':
             add_log("Returned to main menu")
             break
         
-        if choice == '11':
+        if choice == 'c':
             clear_screen()
             new_table_name = get_input("Enter new table name: ")
             if new_table_name:
@@ -155,12 +342,21 @@ def explore_tables(connection, db_name):
                     add_log(f"Error creating table: {e}")
             continue
 
-        if choice == '12':
+        if choice == 'd':
             clear_screen()
-            table_to_del_input = get_input("Enter table name to delete (or its index): ")
+            print(f"=== Delete table in DB '{db_name}' ===")
+            for i, table in enumerate(tables):
+                print(f"{i+1}. {table}")
+            print("-" * 20)
+            
+            table_to_del_input = get_input("Enter table number or name to delete (b to cancel): ")
+            if table_to_del_input.lower() == 'b' or not table_to_del_input:
+                add_log("Delete table cancelled")
+                continue
+                
             table_to_del = table_to_del_input
-            if table_to_del_input.isdigit() and 0 <= int(table_to_del_input) < len(tables):
-                table_to_del = tables[int(table_to_del_input)]
+            if table_to_del_input.isdigit() and 1 <= int(table_to_del_input) <= len(tables):
+                table_to_del = tables[int(table_to_del_input) - 1]
             
             if table_to_del:
                 confirm = get_input(f"Are you sure you want to delete table '{table_to_del}'? (y/n): ").lower()
@@ -174,21 +370,9 @@ def explore_tables(connection, db_name):
                         add_log(f"Error deleting table: {e}")
             continue
         
-        if choice.isdigit() and 0 <= int(choice) < len(tables):
-            selected_table = tables[int(choice)]
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"SELECT * FROM `{selected_table}` LIMIT 50")
-                    rows = cursor.fetchall()
-                    add_log(f"Viewed table '{selected_table}'")
-                    
-                    columns = [desc[0] for desc in cursor.description]
-                    clear_screen()
-                    print(f"\n=== Content of {selected_table} (up to 50 rows) ===")
-                    print(tabulate(rows, headers=columns, tablefmt="grid"))
-                    get_input("\nPress Enter to continue...")
-            except Exception as e:
-                add_log(f"Error reading table {selected_table}: {e}")
+        if choice.isdigit() and 1 <= int(choice) <= len(tables):
+            selected_table = tables[int(choice) - 1]
+            manage_table(connection, db_name, selected_table)
         else:
             add_log(f"Invalid choice: {choice}")
 
@@ -202,31 +386,39 @@ LOGO = r"""
 """
 
 def main():
-    resize_window()
     while True:
         templates = load_templates()
+        req_lines = len(templates) + len(USER_LOGS) + 24
+        resize_window(99, req_lines)
+        
         clear_screen()
         print(LOGO)
         print(f"=== Main menu ===")
-        print("0. Connect to DB (manual)")
-        print("1. Create template")
-        print("2. Delete template")
+        print("1. Connect to DB (manual)")
+        print("2. Create template")
+        print("3. Delete template")
         
         print("-" * 20)
-        template_start_index = 3
+        template_start_index = 4
         for i, t in enumerate(templates):
             db_name = t.get('database', 'No DB specified')
             print(f"{template_start_index + i}. Connect ({t['name']}) - {t['ip']}:{t['port']} [{db_name}]")
         
-        print("\nq. Exit")
+        print("\nq. Exit\n")
+        
+        # Reserve lines for logs below the prompt so ANSI restoration doesn't cause overlap
+        if USER_LOGS:
+            print("\n" * (len(USER_LOGS) + 2), end="")
+            print(f"\033[{len(USER_LOGS) + 2}A", end="") # Move cursor back up (gap + logs)
+            
         print_logs()
         
-        choice = get_input("\n\nSelect action: ").lower()
+        choice = get_input("Select action: ").lower()
         
         if choice == 'q':
             break
             
-        if choice == '0':
+        if choice == '1':
             clear_screen()
             print("--- Manual Connection ---")
             ip = get_input("IP: ")
@@ -237,7 +429,7 @@ def main():
             add_log(f"Manual connection to {database}")
             connect_to_db(ip, port, user, password, database)
             
-        elif choice == '1':
+        elif choice == '2':
             clear_screen()
             print("--- Create Template ---")
             name = get_input("Name: ")
@@ -258,7 +450,7 @@ def main():
             save_templates(templates)
             add_log(f"Template '{name}' created")
             
-        elif choice == '2':
+        elif choice == '3':
             if not templates:
                 add_log("Attempted to delete template when none exist")
                 continue
@@ -267,15 +459,15 @@ def main():
             print("--- Delete Template ---")
             for i, t in enumerate(templates):
                 db_name = t.get('database', 'No DB specified')
-                print(f"{i}. {t['name']} ({t['ip']}:{t['port']}) [{db_name}]")
+                print(f"{i+1}. {t['name']} ({t['ip']}:{t['port']}) [{db_name}]")
                 
             del_choice = get_input("Select template number to delete (b to cancel): ").lower()
             if del_choice == 'b':
                 add_log("Delete action cancelled")
                 continue
                 
-            if del_choice.isdigit() and 0 <= int(del_choice) < len(templates):
-                deleted = templates.pop(int(del_choice))
+            if del_choice.isdigit() and 1 <= int(del_choice) <= len(templates):
+                deleted = templates.pop(int(del_choice) - 1)
                 save_templates(templates)
                 add_log(f"Template '{deleted['name']}' deleted")
             else:
